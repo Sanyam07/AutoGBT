@@ -12,12 +12,13 @@ import time as time
 import numpy as np
 import random
 from libscores import *
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from hyperopt import hp, tpe, STATUS_OK, Trials
 from hyperopt.fmin import fmin
 from hyperopt import space_eval
 import lightgbm as lgbm
+from causalml.propensity import calibrate
 
 class Utils:
     """
@@ -514,48 +515,53 @@ class StreamSaveRetrainPredictor:
                                     'bagging_freq':2,\
                                     'boosting_type':'gbdt',\
                                     'objective':'binary',\
-                                    'metric':'auc'}
+                                    'metric': 'auc',
+                                    'num_threads': -1}
 
             # Adversarial Validation
+            params = {'n_estimators':50,
+                      'learning_rate':0.01,
+                      'num_leaves':31,
+                      'feature_fraction':0.8,
+                      'bagging_fraction':0.5,
+                      'bagging_freq':1,
+                      'boosting_type':'gbdt',
+                      'min_child_samples': 25,
+                      'lambda_l1': .1,
+                      'lambda_l2': .1,
+                      'objective':'binary',
+                      'metric': 'auc',
+                      'num_threads': -1}
+
+            n_trn = XTrain_transformed.shape[0]
+            n_tst = X.shape[0]
+
             print('AV: starting adversarial validation...')
 
             np.random.seed(42)
-            n_av = 100000
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-            trn, tst, y_trn, y_tst = train_test_split(
-                np.vstack((XTrain_transformed[np.random.randint(XTrain_transformed.shape[0], size=n_av)],
-                           self.stream_processor.transform(X[np.random.randint(X.shape[0], size=n_av)]))),
-                np.concatenate((np.ones(n_av,), np.zeros(n_av,))),
-                test_size=.25,
-                shuffle=True
-            )
+            X_all = np.vstack((XTrain_transformed, self.stream_processor.transform(X)))
+            y_all = np.concatenate((np.zeros(n_trn,), np.ones(n_tst,)))
+            print(X_all.shape, y_all.shape)
+            ps_all = np.zeros_like(y_all, dtype=float)
+            for i, (i_trn, i_val) in enumerate(cv.split(X_all, y_all)):
+                trn = X_all[i_trn]
+                val = X_all[i_val]
 
-            cols_to_keep = np.array([True] * trn.shape[1])
-            av_score = 1.
+                trn_lgb = lgbm.Dataset(trn, label=y_all[i_trn])
+                val_lgb = lgbm.Dataset(val, label=y_all[i_val])
 
-            while av_score > .70:
-                trn_av = trn.copy()
-                tst_av = tst.copy()
+                model_av = lgbm.train(params, trn_lgb, 100, val_lgb, early_stopping_rounds=10, verbose_eval=10)
 
-                if sum(~cols_to_keep) > 0:
-                    tst_av[:, ~cols_to_keep] = 0
-                    trn_av[:, ~cols_to_keep] = 0
+                ps_all[i_val] = model_av.predict(val)
 
-                train_data = lgbm.Dataset(trn_av, label=y_trn)
-                test_data = lgbm.Dataset(tst_av, label=y_tst)
+            av_score = roc_auc_score(y_all, ps_all)
+            print(f'AV: AUC={av_score * 100: 3.2f}')
 
-                params = param_choice_fixed if len(self.best_hyperparams) == 0 else self.best_hyperparams
-                params['n_estimators'] = 100
-                model_av = lgbm.train(params, train_data, 100, test_data, early_stopping_rounds=10, verbose_eval=10)
-
-                p_tst = model_av.predict(tst_av)
-                av_score = roc_auc_score(y_tst, p_tst)
-                print(f'AV: AUC={av_score * 100: 3.2f}')
-
-                imp = model_av.feature_importance(importance_type='gain')
-                mean_pos_imp = np.mean(imp[imp > 0])
-                cols_to_keep = (imp < mean_pos_imp) & cols_to_keep
-                print(f'AV: {sum(cols_to_keep)} features to be kept out of {len(imp)} features')
+            ps_all = calibrate(ps_all, y_all)
+            np.clip(ps_all, .1, .9)
+            ps_trn = ps_all[: n_trn]
 
             ### we didnt find the best hyper-parameters yet
             if len(self.best_hyperparams)==0:
@@ -564,7 +570,7 @@ class StreamSaveRetrainPredictor:
 
                 #Get the AUC for the fixed hyperparameter on the internal validation set
                 autohyper = AutoHyperOptimizer(parameter_space=param_choice_fixed)
-                best_score_choice1 = autohyper.fit(XTrain_transformed[:, cols_to_keep],yTrain.ravel(),1)
+                best_score_choice1 = autohyper.fit(XTrain_transformed,yTrain.ravel(),1)
                 print("---------------------------------------------------------------------------------------------------")
                 print("AutoGBT[StreamSaveRetrainPredictor]:Fixed hyperparameters:",param_choice_fixed)
                 print("AutoGBT[StreamSaveRetrainPredictor]:Best scores obtained from Fixed hyperparameter only is:",best_score_choice1)
@@ -610,7 +616,7 @@ class StreamSaveRetrainPredictor:
 
                 #run Hyperopt to search nearby region in the hope to obtain a better combination of hyper-parameters
                 autohyper = AutoHyperOptimizer(max_evaluations=self.max_evaluation, parameter_space=param_space_forFixed)
-                best_hyperparams_choice2, best_score_choice2 = autohyper.fit(XTrain_transformed[:, cols_to_keep],yTrain.ravel(),0)
+                best_hyperparams_choice2, best_score_choice2 = autohyper.fit(XTrain_transformed,yTrain.ravel(),0)
                 print("---------------------------------------------------------------------------------------------------")
                 print("AutoGBT[StreamSaveRetrainPredictor]:Best hyper-param obtained from Fixed Hyperparameters + Runtime Hyperopt is:",best_hyperparams_choice2)
                 print("AutoGBT[StreamSaveRetrainPredictor]:Best score obtained from Fixed Hyperparameter + Runtime Hyperopt is:",best_score_choice2)
@@ -627,21 +633,21 @@ class StreamSaveRetrainPredictor:
             #train lightgbm with best hyperparameter obtained
             self.clf = lgbm.LGBMClassifier(random_state=20,min_data=1, min_data_in_bin=1)
             self.clf.set_params(**self.best_hyperparams)
-            self.clf.fit(XTrain_transformed[:, cols_to_keep], yTrain.ravel())
-            print('AutoGBT[StreamSaveRetrainPredictor]:LGBM Fit complete on:',XTrain_transformed[:, cols_to_keep].shape)
+            self.clf.fit(XTrain_transformed, yTrain.ravel(), sample_weight=1 / (1 - ps_trn))
+            print('AutoGBT[StreamSaveRetrainPredictor]:LGBM Fit complete on:',XTrain_transformed.shape)
 
         ## do we need to make prediction in batch mode (chunking) due to memory limit?
         batch_size = 100000
         print('AutoGBT[StreamSaveRetrainPredictor]:predict split size:',X.shape)
         if X.shape[0] <=batch_size: ### if it is relatively small array
-            return self.clf.predict_proba(self.stream_processor.transform(X)[:, cols_to_keep])[:,1]
+            return self.clf.predict_proba(self.stream_processor.transform(X))[:,1]
         else:
             results = np.array([]) ## for chunking results to handle memory limit
             for i in range(0,X.shape[0],batch_size):
                 Xsplit = X[i:(i+batch_size),:]
                 print('AutoGBT[StreamSaveRetrainPredictor]Chunking Prediction: processing split:'\
                       ,i,i+batch_size,'shape=',Xsplit.shape)
-                results = np.append(results,self.clf.predict_proba(self.stream_processor.transform(Xsplit)[:, cols_to_keep])[:,1])
+                results = np.append(results,self.clf.predict_proba(self.stream_processor.transform(Xsplit))[:,1])
                 del Xsplit
             print("AutoGBT[StreamSaveRetrainPredictor]:RESULTS SHAPE:",np.array(results).shape)
             return np.array(results).T
