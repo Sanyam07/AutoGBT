@@ -6,6 +6,7 @@ Authors:  Jobin Wilson (jobin.wilson@flytxt.com)
 '''
 
 from collections import Counter
+from copy import copy
 import pandas as pd
 from functools import wraps
 import time as time
@@ -19,21 +20,22 @@ from hyperopt.fmin import fmin
 from hyperopt import space_eval
 import lightgbm as lgbm
 from causalml.propensity import calibrate
+from kaggler.preprocessing import LabelEncoder
 
 class Utils:
     """
     Generic utility functions that our model would require
     """
     @staticmethod
-    def random_sample_in_order(X,y,removeperc,seed=1):
-        if removeperc==0:
-            return X,y
-        num_train_samples = len(X)
+    def random_sample_in_order(l, removeperc,seed=1):
+        if removeperc == 0:
+            return l
+        num_train_samples = len(l[0])
         rem_samples=int(num_train_samples*removeperc)
         np.random.seed(seed)
         skip = sorted(random.sample(range(num_train_samples),num_train_samples-rem_samples))
-        print('AutoGBT[Utils]:Random sample length:',num_train_samples-rem_samples)
-        return X[skip,:],y[skip,:]
+        print('AutoGBT[Utils]:Random sample length:', num_train_samples-rem_samples)
+        return [x[skip] for x in l]
 
 
     """
@@ -130,24 +132,27 @@ class AutoHyperOptimizer:
         self.param_space = parameter_space
 
 
-    def gbc_objective(self,space):
+    def gbc_objective(self, space):
 
         print('AutoGBT[AutoHyperOptimizer]:Parameter space:',space)
-        model = lgbm.LGBMClassifier(random_state=self.seed,min_data=1, min_data_in_bin=1)
+        model = lgbm.LGBMClassifier(random_state=self.seed)
         model.set_params(**space)
-        model.fit(self.Xe_train,self.ys_train)
+        model.fit(self.Xe_train, self.ys_train, sample_weight=self.w_train)
         mypreds = model.predict_proba(self.Xe_test)[:,1]
         auc = auc_metric(self.ys_test.reshape(-1,1),mypreds.reshape(-1,1))
         print('AutoGBT[AutoHyperOptimizer] auc=',auc)
         return{'loss': (1-auc), 'status': STATUS_OK }
 
-    def fit(self,X,y,indicator):
+    def fit(self, X, y, indicator, w=None):
         '''
         indicator=1 means we intend to do just sampling and one-time fitting
         for evaluating a fixed set of hyper-parameters,
         0 means run hyperopt to search in the neighborhood of the seed
         hyper-parameters to see if model quality is improving.
         '''
+        if w is None:
+            w = np.ones_like(y)
+
         num_samples = len(X)
         print('AutoGBT[AutoHyperOptimizer]:Total samples passed for'\
               'hyperparameter tuning:',num_samples)
@@ -155,26 +160,27 @@ class AutoHyperOptimizer:
             removeperc = 1.0 - (float(self.max_samples)/num_samples)
             print ('AutoGBT[AutoHyperOptimizer]:Need to downsample for managing time:,'\
                    'I will remove data percentage',removeperc)
-            XFull,yFull = Utils.random_sample_in_order(X,y.reshape(-1,1),removeperc)
+            XFull, yFull, wFull = Utils.random_sample_in_order([X, y, w], removeperc)
             print('AutoGBT[AutoHyperOptimizer]:downsampled data length',len(XFull))
         else:
             XFull = X
             yFull = y
+            wFull = w
 
-        self.Xe_train, self.Xe_test, self.ys_train, self.ys_test = \
-        train_test_split(XFull, yFull.ravel(),test_size = self.test_size, random_state=self.seed,shuffle=True)
+        self.Xe_train, self.Xe_test, self.ys_train, self.ys_test, self.w_train, _ = \
+        train_test_split(XFull, yFull, wFull, test_size = self.test_size, random_state=self.seed, shuffle=True)
 
         if indicator == 1:
             ## just fit lightgbm once to obtain the AUC w.r.t a fixed set of hyper-parameters ##
-            model = lgbm.LGBMClassifier(random_state=self.seed,min_data=1, min_data_in_bin=1)
+            model = lgbm.LGBMClassifier(random_state=self.seed)
             model.set_params(**self.param_space)
-            model.fit(self.Xe_train,self.ys_train)
+            model.fit(self.Xe_train, self.ys_train, sample_weight=self.w_train)
             mypreds = model.predict_proba(self.Xe_test)[:,1]
             auc = auc_metric(self.ys_test.reshape(-1,1),mypreds.reshape(-1,1))
             return auc
         else:
             trials = Trials()
-            best = fmin(fn=self.gbc_objective,space=self.param_space,algo=tpe.suggest,trials=trials,max_evals=self.max_evaluations)
+            best = fmin(fn=self.gbc_objective, space=self.param_space, algo=tpe.suggest, trials=trials, max_evals=self.max_evaluations)
             params = space_eval(self.param_space, best)
             print('AutoGBT[AutoHyperOptimizer]:Best hyper-parameters',params)
             self.best_params = params
@@ -194,6 +200,7 @@ class GenericStreamPreprocessor:
     def __init__(self):
         self.categorical_cols=[]
         self.date_cols=[]
+        self.transformed_date_cols=[]
         self.redundant_catcols = []
         self.ohe_cols = []
         self.frequency_encode = True
@@ -245,7 +252,10 @@ class GenericStreamPreprocessor:
         Update frequency count of all categorical/multi-categorical values
         Maintain a map of minimum values in each date column for encoding
         """
+        self.lbe = LabelEncoder(min_obs=10)
+        self.lbe.fit(pd.DataFrame(X[:, self.categorical_cols], columns=self.categorical_cols))
         for col in range(X.shape[1]):
+            """
             if col in self.categorical_cols and self.frequency_encode ==True :
                 if X.shape[0] > 200000:
                     ## count using pandas if it is a large dataset
@@ -261,6 +271,8 @@ class GenericStreamPreprocessor:
                           'updating feature count map for column:',col, len(self.featureMap[col]))
 
             elif col in self.date_cols and self.date_encode == True:
+            """
+            if col in self.date_cols and self.date_encode == True:
                 ## find minimum non-zero value corresponding to each date columns ##
                 date_col = X[:,col].astype(float)
                 non_zero_idx = np.nonzero(date_col)[0]
@@ -285,24 +297,35 @@ class GenericStreamPreprocessor:
     @simple_time_tracker(_log)
     def transform(self,X):
         result = []
+        X[:, self.categorical_cols] = self.lbe.transform(pd.DataFrame(X[:, self.categorical_cols],
+                                                                      columns=self.categorical_cols)).values
         for col in range(X.shape[1]):
+            """
             if col in self.categorical_cols:
                 ### DO FREQUENCY ENCODING ####
                 freq_encoded_col = np.vectorize(self.freqMap[col].get)(X[:,col])
                 result.append(freq_encoded_col)
 
             elif col in self.date_cols:
+            """
+            if col in self.date_cols:
                 transformed_date_col = X[:,col].astype(float) - self.dateMap[col]
                 result.append(transformed_date_col)
             else: ### it must be a numeric feature
                 result.append(X[:,col])
 
         ### add dynamic date difference features and other generated features ###
+        self.transformed_date_cols = copy(self.date_cols)
+        if not isinstance(self.transformed_date_cols, list):
+            self.transformed_date_cols = self.transformed_date_cols.tolist()
+
         for i in range(len(self.date_cols)):
             for j in range(i+1,len(self.date_cols)):
                 if len(np.nonzero(X[:,i]))>0 and len(np.nonzero(X[:,j]))>0:
                     print('AutoGBT[GenericStreamPreprocessor]:datediff from nonzero cols:',i,j)
                     result.append(X[:,i]-X[:,j])
+                    col += 1
+                    self.transformed_date_cols.append(col)
 
             dates = pd.DatetimeIndex(X[:,i])
             ## get the date column
@@ -316,14 +339,39 @@ class GenericStreamPreprocessor:
             year = dates.year.values
 
             result.append(dayofweek)
-            result.append(dayofyear)
-            result.append(month)
-            result.append(weekofyear)
-            result.append(year)
-            result.append(day)
-            result.append(hour)
-            result.append(minute)
+            col += 1
+            self.transformed_date_cols.append(col)
 
+            result.append(dayofyear)
+            col += 1
+            self.transformed_date_cols.append(col)
+
+            result.append(month)
+            col += 1
+            self.transformed_date_cols.append(col)
+
+            result.append(weekofyear)
+            col += 1
+            self.transformed_date_cols.append(col)
+
+            result.append(year)
+            col += 1
+            self.transformed_date_cols.append(col)
+
+            result.append(day)
+            col += 1
+            self.transformed_date_cols.append(col)
+
+            result.append(hour)
+            col += 1
+            self.transformed_date_cols.append(col)
+
+            result.append(minute)
+            col += 1
+            self.transformed_date_cols.append(col)
+
+        print(f'total {len(result)} transformed features')
+        print(f'transformed date cols: {self.transformed_date_cols}')
         return np.array(result).T
 
     def get_ohe_candidate_columns(self):
@@ -498,7 +546,7 @@ class StreamSaveRetrainPredictor:
                 removeperc = 1.0 - (float(self.max_train_data)/num_train_samples)
                 print('AutoGBT[StreamSaveRetrainPredictor]:Level-2 Sampling...'\
                       'Too much training data..I need to subsample:remove',removeperc)
-                XTrain,yTrain = Utils.random_sample_in_order(self.XFull,self.yFull.reshape(-1,1),removeperc)
+                XTrain, yTrain = Utils.random_sample_in_order([self.XFull, self.yFull], removeperc)
                 print('AutoGBT[StreamSaveRetrainPredictor]:downsampled training data length=',len(XTrain))
             else:
                 XTrain = self.XFull
@@ -519,14 +567,14 @@ class StreamSaveRetrainPredictor:
                                     'num_threads': -1}
 
             # Adversarial Validation
-            params = {'n_estimators':50,
-                      'learning_rate':0.01,
-                      'num_leaves':31,
-                      'feature_fraction':0.8,
-                      'bagging_fraction':0.5,
-                      'bagging_freq':1,
+            params = {'n_estimators': 50,
+                      'learning_rate': .01,
+                      'num_leaves': 31,
+                      'feature_fraction': .8,
+                      'bagging_fraction': .5,
+                      'bagging_freq': 1,
                       'boosting_type':'gbdt',
-                      'min_child_samples': 25,
+                      'min_child_samples': 10,
                       'lambda_l1': .1,
                       'lambda_l2': .1,
                       'objective':'binary',
@@ -541,9 +589,13 @@ class StreamSaveRetrainPredictor:
             np.random.seed(42)
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-            X_all = np.vstack((XTrain_transformed, self.stream_processor.transform(X)))
+            non_date_cols = np.array([x for x in range(XTrain_transformed.shape[1])
+                                      if x not in self.stream_processor.transformed_date_cols])
+            X_all = np.vstack((XTrain_transformed[:, non_date_cols],
+                               self.stream_processor.transform(X)[:, non_date_cols]))
             y_all = np.concatenate((np.zeros(n_trn,), np.ones(n_tst,)))
-            print(X_all.shape, y_all.shape)
+            print('AV: ', X_all.shape, y_all.shape)
+
             ps_all = np.zeros_like(y_all, dtype=float)
             for i, (i_trn, i_val) in enumerate(cv.split(X_all, y_all)):
                 trn = X_all[i_trn]
@@ -560,8 +612,11 @@ class StreamSaveRetrainPredictor:
             print(f'AV: AUC={av_score * 100: 3.2f}')
 
             ps_all = calibrate(ps_all, y_all)
-            np.clip(ps_all, .1, .9)
-            ps_trn = ps_all[: n_trn]
+            print(f'AV: ps dist (org)={np.percentile(ps_all, np.linspace(0, 100, 11))}')
+            ps_trn = np.clip(ps_all, .1, .9)[: n_trn]
+            w_trn = ps_trn / (1 - ps_trn)
+            print(f'AV: ps dist (clip)={np.percentile(ps_trn, np.linspace(0, 100, 11))}')
+            print(f'AV: w dist={np.percentile(w_trn, np.linspace(0, 100, 11))}')
 
             ### we didnt find the best hyper-parameters yet
             if len(self.best_hyperparams)==0:
@@ -570,7 +625,7 @@ class StreamSaveRetrainPredictor:
 
                 #Get the AUC for the fixed hyperparameter on the internal validation set
                 autohyper = AutoHyperOptimizer(parameter_space=param_choice_fixed)
-                best_score_choice1 = autohyper.fit(XTrain_transformed,yTrain.ravel(),1)
+                best_score_choice1 = autohyper.fit(XTrain_transformed, yTrain.ravel(), 1, w_trn)
                 print("---------------------------------------------------------------------------------------------------")
                 print("AutoGBT[StreamSaveRetrainPredictor]:Fixed hyperparameters:",param_choice_fixed)
                 print("AutoGBT[StreamSaveRetrainPredictor]:Best scores obtained from Fixed hyperparameter only is:",best_score_choice1)
@@ -616,7 +671,7 @@ class StreamSaveRetrainPredictor:
 
                 #run Hyperopt to search nearby region in the hope to obtain a better combination of hyper-parameters
                 autohyper = AutoHyperOptimizer(max_evaluations=self.max_evaluation, parameter_space=param_space_forFixed)
-                best_hyperparams_choice2, best_score_choice2 = autohyper.fit(XTrain_transformed,yTrain.ravel(),0)
+                best_hyperparams_choice2, best_score_choice2 = autohyper.fit(XTrain_transformed, yTrain.ravel(), 0, w_trn)
                 print("---------------------------------------------------------------------------------------------------")
                 print("AutoGBT[StreamSaveRetrainPredictor]:Best hyper-param obtained from Fixed Hyperparameters + Runtime Hyperopt is:",best_hyperparams_choice2)
                 print("AutoGBT[StreamSaveRetrainPredictor]:Best score obtained from Fixed Hyperparameter + Runtime Hyperopt is:",best_score_choice2)
@@ -631,9 +686,9 @@ class StreamSaveRetrainPredictor:
 
             print("AutoGBT[StreamSaveRetrainPredictor]:Best hyper-param obtained is:",self.best_hyperparams)
             #train lightgbm with best hyperparameter obtained
-            self.clf = lgbm.LGBMClassifier(random_state=20,min_data=1, min_data_in_bin=1)
+            self.clf = lgbm.LGBMClassifier(random_state=20)
             self.clf.set_params(**self.best_hyperparams)
-            self.clf.fit(XTrain_transformed, yTrain.ravel(), sample_weight=1 / (1 - ps_trn))
+            self.clf.fit(XTrain_transformed, yTrain.ravel(), sample_weight=w_trn)
             print('AutoGBT[StreamSaveRetrainPredictor]:LGBM Fit complete on:',XTrain_transformed.shape)
 
         ## do we need to make prediction in batch mode (chunking) due to memory limit?
