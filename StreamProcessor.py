@@ -614,7 +614,8 @@ class StreamSaveRetrainPredictor:
             ps_all = calibrate(ps_all, y_all)
             print(f'AV: ps dist (org)={np.percentile(ps_all, np.linspace(0, 100, 11))}')
             ps_trn = np.clip(ps_all, .1, .9)[: n_trn]
-            w_trn = ps_trn / (1 - ps_trn)
+            #w_trn = ps_trn / (1 - ps_trn)
+            w_trn = np.ones_like(ps_trn)
             print(f'AV: ps dist (clip)={np.percentile(ps_trn, np.linspace(0, 100, 11))}')
             print(f'AV: w dist={np.percentile(w_trn, np.linspace(0, 100, 11))}')
 
